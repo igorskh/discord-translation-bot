@@ -1,0 +1,6 @@
+venv
+export.sh
+run.sh
+__pycache__
+.vscode
+db.json
