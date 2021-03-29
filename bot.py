@@ -65,6 +65,7 @@ class DiscordTranslatorBotClient(discord.Client):
         _, translated = self._translate(message.content[3:], lang_code)
         if translated is not None:
             reply_msg = await message.reply(translated)
+            return True
 
     async def _config(self, message) -> bool:
         match = self._config_prefix_re.match(message.content)
