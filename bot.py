@@ -7,6 +7,9 @@ import asyncio
 
 from google.cloud import translate_v2 as translate
 
+KEY_ENABLED_LANGS = "enabled_langs"
+KEY_ACTIVATED_USERS = "activated_users"
+
 
 class DiscordTranslatorBotClient(discord.Client):
     _available_languages = {}
@@ -50,7 +53,7 @@ class DiscordTranslatorBotClient(discord.Client):
         self._servers_config = json.load(open(self._save_path, "r"))
 
     async def _manual_translate(self, message):
-        match = self._prefix_re.match(message.content)
+        match = self._prefix_re.match(message.clean_content)
         if not match:
             return
 
@@ -59,9 +62,10 @@ class DiscordTranslatorBotClient(discord.Client):
             await message.channel.send(f"Unrecognized language code {lang_code}")
             return
 
-        translated = self._translate(message.content[3:], lang_code)
+        _, translated = self._translate(message.content[3:], lang_code)
         if translated is not None:
             reply_msg = await message.reply(translated)
+            return True
 
     async def _config(self, message) -> bool:
         match = self._config_prefix_re.match(message.content)
@@ -73,20 +77,52 @@ class DiscordTranslatorBotClient(discord.Client):
             await self._config_timeout(message)
         elif cmd == "auto":
             await self._config_auto_tr(message)
+        elif cmd == "enable" or cmd == "disable":
+            await self._config_enable_lang(cmd, message)
         return True
+
+    async def _config_enable_lang(self, cmd: str, message) -> bool:
+        guild_id = str(message.guild.id)
+        enabled_langs = self._get_server_config(guild_id, KEY_ENABLED_LANGS)
+
+        if enabled_langs is None:
+            enabled_langs = []
+
+        parts = message.content.split()
+
+        if len(parts) < 2:
+            return False
+
+        for p in parts[1:]:
+            lang_code = str(p).lower()
+
+            if not lang_code in self._available_languages:
+                return False
+
+            if cmd == "enable" and not lang_code in enabled_langs:
+                enabled_langs.append(lang_code)
+            elif cmd == "disable" and lang_code in enabled_langs:
+                enabled_langs.remove(lang_code)
+
+        self._set_server_config(guild_id, KEY_ENABLED_LANGS, enabled_langs)
+        await message.reply("Current list: " + " ".join(enabled_langs))
 
     # checks every message if needs translation
     async def _auto_translate(self, message) -> bool:
         user_id = str(message.author.id)
         guild_id = str(message.guild.id)
-        activated_users = self._get_server_config(guild_id, "activated_users")
+        enabled_langs = self._get_server_config(guild_id, KEY_ENABLED_LANGS)
+
+        activated_users = self._get_server_config(
+            guild_id, KEY_ACTIVATED_USERS)
 
         if activated_users is None or not user_id in activated_users or not activated_users[user_id]["active"]:
             return False
 
         lang_code = activated_users[user_id]["target_lang_code"]
-        translated = self._translate(message.content, lang_code)
-        if translated is None:
+        enabled, translated = self._translate(
+            message.clean_content, lang_code, enabled_langs)
+        if not enabled or translated is None:
             return True
 
         await message.reply(translated)
@@ -114,7 +150,8 @@ class DiscordTranslatorBotClient(discord.Client):
         if len(parts) < 2:
             return False
 
-        activated_users = self._get_server_config(guild_id, "activated_users")
+        activated_users = self._get_server_config(
+            guild_id, KEY_ACTIVATED_USERS)
         if activated_users is None:
             activated_users = {}
 
@@ -135,8 +172,8 @@ class DiscordTranslatorBotClient(discord.Client):
                 await message.channel.send(f"Unrecognized language code {lang_code}")
                 return
             activated_users[user_id]["target_lang_code"] = lang_code
-            await message.channel.send(f"Turn {parts[1]} translation to {self._available_languages[lang_code]} for {message.author.nick}")
-        self._set_server_config(guild_id, "activated_users", activated_users)
+            await message.channel.send(f"Turn {parts[1]} translation to {self._available_languages[lang_code]} for {message.author.mention}")
+        self._set_server_config(guild_id, KEY_ACTIVATED_USERS, activated_users)
         return True
 
     def init_translator(self):
@@ -146,18 +183,18 @@ class DiscordTranslatorBotClient(discord.Client):
     def load_flags(self, path: str):
         self._flags = json.load(open(path, "r"))
 
-    def _translate(self, text: str, target_language_code: str):
+    def _translate(self, text: str, target_language_code: str, enabled_langs: list = []):
         target_language_code = target_language_code.lower()
         if self._translate_client is None:
             print("_translate_client is not initialised")
-            return
+            return False, None
         result = self._translate_client.translate(
             text,
             target_language=target_language_code
         )
         if result["detectedSourceLanguage"] == target_language_code:
-            return None
-        return result["translatedText"]
+            return False, None
+        return result["detectedSourceLanguage"] in enabled_langs, result["translatedText"]
 
     @property
     def available_languages(self):
@@ -174,24 +211,27 @@ class DiscordTranslatorBotClient(discord.Client):
         print('Logged on as', self.user)
 
     async def on_reaction_add(self, reaction, user):
-        guild_id = str(reaction.guild.id)
+        guild_id = str(reaction.message.guild.id)
         if not reaction.emoji in self._flags:
             return
 
         lang = self._flags[reaction.emoji]
 
-        translated = self._translate(reaction.message.content, lang["code"])
+        _, translated = self._translate(reaction.message.content, lang["code"])
         reply_msg = await reaction.message.reply(translated)
 
         remove_timeout = self._get_server_config(guild_id, "timeout")
-        await reply_msg.delete(delay=remove_timeout)
+        if not remove_timeout is None:
+            await reply_msg.delete(delay=remove_timeout)
+            await asyncio.sleep(remove_timeout)
+            await reaction.clear()
 
-        await asyncio.sleep(remove_timeout)
-        await reaction.clear()
-
-    async def on_message(self, message):
+    async def on_message(self, message: discord.Message):
         if message.author == self.user:
             return
+
+        if self.user.mentioned_in(message):
+            await message.reply("I'm here")
 
         if await self._config(message):
             return
